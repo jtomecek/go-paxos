@@ -21,6 +21,13 @@ type Proposer struct {
 	quorumSize int
 	peerCount  int
 
+	// acceptor is this node's local acceptor. A proposer is also an acceptor,
+	// and a quorum is a majority of ALL nodes including self, so the proposer
+	// counts its own vote here instead of only tallying peer responses. It is
+	// always set in production (see NewNode); it may be nil in isolated unit
+	// tests, in which case only peer votes are counted.
+	acceptor *Acceptor
+
 	prepareTimeout time.Duration
 	acceptTimeout  time.Duration
 
@@ -169,12 +176,27 @@ func (p *Proposer) runPhase1(ctx context.Context, state *proposalState) (Value, 
 		"ballot", state.ballot,
 	)
 
-	// Send Prepare to all acceptors
 	prepareMsg := &Prepare{
 		Ballot:   state.ballot,
 		Instance: state.instance,
 	}
 
+	promises := make([]*Promise, 0, p.quorumSize)
+
+	// Count our own acceptor's vote toward the quorum before asking peers.
+	if p.acceptor != nil {
+		switch m := p.acceptor.HandlePrepare(prepareMsg).(type) {
+		case *Promise:
+			promises = append(promises, m)
+			if len(promises) >= p.quorumSize {
+				return p.findHighestAccepted(promises), nil
+			}
+		case *Reject:
+			return nil, ErrPreempted
+		}
+	}
+
+	// Send Prepare to all peers
 	if err := p.transport.Broadcast(ctx, prepareMsg); err != nil {
 		return nil, err
 	}
@@ -182,8 +204,6 @@ func (p *Proposer) runPhase1(ctx context.Context, state *proposalState) (Value, 
 	// Wait for quorum of promises
 	ctx, cancel := context.WithTimeout(ctx, p.prepareTimeout)
 	defer cancel()
-
-	promises := make([]*Promise, 0, p.quorumSize)
 
 	for {
 		select {
@@ -229,13 +249,28 @@ func (p *Proposer) runPhase2(ctx context.Context, state *proposalState) error {
 		"valueLen", len(state.value),
 	)
 
-	// Send Accept to all acceptors
 	acceptMsg := &Accept{
 		Ballot:   state.ballot,
 		Instance: state.instance,
 		Value:    state.value,
 	}
 
+	accepteds := make([]*Accepted, 0, p.quorumSize)
+
+	// Count our own acceptor's vote toward the quorum before asking peers.
+	if p.acceptor != nil {
+		switch m := p.acceptor.HandleAccept(acceptMsg).(type) {
+		case *Accepted:
+			accepteds = append(accepteds, m)
+			if len(accepteds) >= p.quorumSize {
+				return p.broadcastCommit(ctx, state)
+			}
+		case *Nack:
+			return ErrPreempted
+		}
+	}
+
+	// Send Accept to all peers
 	if err := p.transport.Broadcast(ctx, acceptMsg); err != nil {
 		return err
 	}
@@ -243,8 +278,6 @@ func (p *Proposer) runPhase2(ctx context.Context, state *proposalState) error {
 	// Wait for quorum of accepteds
 	ctx, cancel := context.WithTimeout(ctx, p.acceptTimeout)
 	defer cancel()
-
-	accepteds := make([]*Accepted, 0, p.quorumSize)
 
 	for {
 		select {

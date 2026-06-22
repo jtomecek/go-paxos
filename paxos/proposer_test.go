@@ -139,6 +139,54 @@ func TestProposer_ConcurrentProposals(t *testing.T) {
 	}
 }
 
+// TestProposer_SelfCountsTowardQuorum verifies a proposer counts its own
+// acceptor's vote, so in a 3-node cluster (quorum 2) it can commit with only a
+// single peer reachable (self + 1 peer). Before the fix the proposer tallied
+// peers only, so it needed both peers and would stall with one down.
+func TestProposer_SelfCountsTowardQuorum(t *testing.T) {
+	const peerCount = 2 // 3-node cluster
+	const quorum = 2
+
+	transport := newFakeTransport()
+	defer transport.Close()
+
+	acceptor, err := NewAcceptor(1, NewMemoryStorage(), nil)
+	if err != nil {
+		t.Fatalf("NewAcceptor: %v", err)
+	}
+
+	proposer := NewProposer(1, transport, quorum, peerCount, nil)
+	proposer.acceptor = acceptor
+	proposer.SetTimeouts(2*time.Second, 2*time.Second)
+
+	// Driver simulates exactly ONE reachable peer (node 2); node 3 is "down".
+	driverDone := make(chan struct{})
+	go func() {
+		defer close(driverDone)
+		for sent := range transport.broadcasts {
+			switch m := sent.(type) {
+			case *Prepare:
+				proposer.HandleResponse(&Promise{Ballot: m.Ballot, Instance: m.Instance, FromNode: 2})
+			case *Accept:
+				proposer.HandleResponse(&Accepted{Ballot: m.Ballot, Instance: m.Instance, FromNode: 2})
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	inst, err := proposer.Propose(ctx, []byte("hello"))
+	if err != nil {
+		t.Fatalf("Propose with self + 1 peer should succeed, got: %v", err)
+	}
+	if inst != 1 {
+		t.Fatalf("expected instance 1, got %d", inst)
+	}
+
+	transport.Close()
+	<-driverDone
+}
+
 // TestProposer_HandleResponseIgnoresStale verifies HandleResponse silently
 // drops responses for unknown instances or stale ballots, rather than
 // blocking or panicking.

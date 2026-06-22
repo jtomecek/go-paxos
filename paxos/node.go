@@ -105,6 +105,10 @@ func NewNode(cfg Config) (*Node, error) {
 	// reaches peers, so this is how a value we propose ends up in our own log.
 	proposer.onCommit = n.handleCommit
 
+	// Give the proposer our local acceptor so it counts its own vote toward
+	// quorums (a quorum is a majority of all nodes, including self).
+	proposer.acceptor = acceptor
+
 	// Recover committed log from storage
 	if err := n.recoverLog(); err != nil {
 		cancel()
