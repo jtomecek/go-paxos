@@ -1,5 +1,7 @@
 # go-paxos
 
+[![CI](https://github.com/jtomecek/go-paxos/actions/workflows/ci.yml/badge.svg)](https://github.com/jtomecek/go-paxos/actions/workflows/ci.yml)
+
 A clean, educational, and production-quality implementation of the Multi-Paxos consensus algorithm in Go.
 
 ## Overview
