@@ -2,6 +2,7 @@ package paxos
 
 import (
 	"context"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -29,7 +30,15 @@ type Node struct {
 	// Leader election state
 	currentLeader NodeID
 	leaderBallot  Ballot
-	lastHeartbeat time.Time
+	// electionDeadline is when a follower will call an election if it has not
+	// heard from a leader. It is randomized (see randomElectionTimeout) so that
+	// nodes don't all time out together and duel for leadership.
+	electionDeadline time.Time
+	// electing guards against starting more than one election at a time; an
+	// election can take up to PrepareTimeout*2 while the ticker keeps firing.
+	electing bool
+	// rng backs randomElectionTimeout. Only accessed while holding mu.
+	rng *rand.Rand
 
 	// Lifecycle
 	ctx    context.Context
@@ -87,9 +96,14 @@ func NewNode(cfg Config) (*Node, error) {
 		lastCommitted: 0,
 		commitCh:      make(chan CommittedValue, 100),
 		currentLeader: 0,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano() + int64(cfg.NodeID))),
 		ctx:           ctx,
 		cancel:        cancel,
 	}
+
+	// Let the proposer deliver our own commits to the learner. Broadcast only
+	// reaches peers, so this is how a value we propose ends up in our own log.
+	proposer.onCommit = n.handleCommit
 
 	// Recover committed log from storage
 	if err := n.recoverLog(); err != nil {
@@ -131,6 +145,12 @@ func (n *Node) Start() error {
 			// Continue - we'll retry later
 		}
 	}
+
+	// Arm the election timer so the first election waits a (randomized) timeout
+	// instead of firing immediately on the zero-valued deadline.
+	n.mu.Lock()
+	n.resetElectionDeadline()
+	n.mu.Unlock()
 
 	// Start message handler
 	n.wg.Add(1)
@@ -308,7 +328,8 @@ func (n *Node) handleHeartbeat(msg *Heartbeat) {
 	if msg.Ballot >= n.leaderBallot {
 		n.currentLeader = msg.LeaderID
 		n.leaderBallot = msg.Ballot
-		n.lastHeartbeat = time.Now()
+		// We've heard from a live leader; defer any election.
+		n.resetElectionDeadline()
 
 		// If we thought we were leader, step down
 		if n.proposer.IsLeader() && msg.LeaderID != n.nodeID {
@@ -338,33 +359,52 @@ func (n *Node) electionLoop() {
 // checkLeaderAndHeartbeat either sends heartbeats (if leader) or
 // checks if an election is needed.
 func (n *Node) checkLeaderAndHeartbeat() {
-	n.mu.RLock()
-	isLeader := n.proposer.IsLeader()
-	lastHeartbeat := n.lastHeartbeat
-	lastCommitted := n.lastCommitted
-	n.mu.RUnlock()
+	if n.proposer.IsLeader() {
+		n.mu.RLock()
+		lastCommitted := n.lastCommitted
+		n.mu.RUnlock()
+		n.sendHeartbeat(lastCommitted)
+		return
+	}
 
-	if isLeader {
-		// Send heartbeat
-		msg := &Heartbeat{
-			Ballot:       n.proposer.LeaderBallot(),
-			LeaderID:     n.nodeID,
-			LastInstance: lastCommitted,
-		}
-		if err := n.transport.Broadcast(n.ctx, msg); err != nil {
-			n.logger.Error("Node: failed to send heartbeat", "error", err)
-		}
-	} else {
-		// Check if election timeout has passed
-		if time.Since(lastHeartbeat) > n.config.ElectionTimeout {
-			n.logger.Info("Node: leader timeout, starting election")
-			go n.startElection()
-		}
+	// Not leader: start an election if our deadline has passed and one isn't
+	// already running. Pushing the deadline out under the same lock prevents
+	// the ticker from spawning a second election while this one is in flight.
+	n.mu.Lock()
+	needElection := !n.electing && time.Now().After(n.electionDeadline)
+	if needElection {
+		n.electing = true
+		n.resetElectionDeadline()
+	}
+	n.mu.Unlock()
+
+	if needElection {
+		n.logger.Info("Node: leader timeout, starting election")
+		go n.startElection()
 	}
 }
 
-// startElection attempts to become the leader.
+// sendHeartbeat broadcasts a leader heartbeat to the peers.
+func (n *Node) sendHeartbeat(lastCommitted Instance) {
+	msg := &Heartbeat{
+		Ballot:       n.proposer.LeaderBallot(),
+		LeaderID:     n.nodeID,
+		LastInstance: lastCommitted,
+	}
+	if err := n.transport.Broadcast(n.ctx, msg); err != nil {
+		n.logger.Error("Node: failed to send heartbeat", "error", err)
+	}
+}
+
+// startElection attempts to become the leader. Only one runs at a time; the
+// caller sets n.electing and this clears it on return.
 func (n *Node) startElection() {
+	defer func() {
+		n.mu.Lock()
+		n.electing = false
+		n.mu.Unlock()
+	}()
+
 	ctx, cancel := context.WithTimeout(n.ctx, n.config.PrepareTimeout*2)
 	defer cancel()
 
@@ -374,13 +414,37 @@ func (n *Node) startElection() {
 
 	if err := n.proposer.BecomeLeader(ctx, fromInstance); err != nil {
 		n.logger.Debug("Node: failed to become leader", "error", err)
+		// Back off (with fresh jitter) before the next attempt.
+		n.mu.Lock()
+		n.resetElectionDeadline()
+		n.mu.Unlock()
 		return
 	}
 
 	n.mu.Lock()
 	n.currentLeader = n.nodeID
-	n.lastHeartbeat = time.Now()
+	n.leaderBallot = n.proposer.LeaderBallot()
+	lastCommitted := n.lastCommitted
+	n.resetElectionDeadline()
 	n.mu.Unlock()
+
+	// Assert leadership immediately so followers reset their election timers
+	// before they time out and start a competing election.
+	n.sendHeartbeat(lastCommitted)
+}
+
+// resetElectionDeadline pushes the next election timeout out by a randomized
+// interval. Must be called with n.mu held.
+func (n *Node) resetElectionDeadline() {
+	n.electionDeadline = time.Now().Add(n.randomElectionTimeout())
+}
+
+// randomElectionTimeout returns a value in [ElectionTimeout, 2*ElectionTimeout).
+// The randomization breaks symmetry between nodes so they don't repeatedly
+// duel for leadership. Must be called with n.mu held (uses n.rng).
+func (n *Node) randomElectionTimeout() time.Duration {
+	base := n.config.ElectionTimeout
+	return base + time.Duration(n.rng.Int63n(int64(base)))
 }
 
 // recoverLog loads committed entries from storage.

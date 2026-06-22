@@ -41,6 +41,11 @@ type Proposer struct {
 	// pending tracks in-flight proposals, keyed by instance.
 	// Node.handleMessage looks responses up here via HandleResponse.
 	pending map[Instance]*proposalState
+
+	// onCommit, if set, is invoked with the Commit message when a proposal
+	// reaches a quorum. Transport.Broadcast only reaches remote peers, so this
+	// hook is how the proposing node delivers the commit to its own learner.
+	onCommit func(*Commit)
 }
 
 // proposalState tracks the state of a single proposal.
@@ -285,6 +290,13 @@ func (p *Proposer) broadcastCommit(ctx context.Context, state *proposalState) er
 		"instance", state.instance,
 		"ballot", state.ballot,
 	)
+
+	// Deliver the commit to our own learner first: the value is already chosen
+	// (a quorum accepted it), and Broadcast below only reaches remote peers, so
+	// without this the proposing node would never learn its own committed value.
+	if p.onCommit != nil {
+		p.onCommit(commitMsg)
+	}
 
 	return p.transport.Broadcast(ctx, commitMsg)
 }
