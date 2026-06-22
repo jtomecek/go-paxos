@@ -71,11 +71,11 @@ func NewAcceptor(nodeID NodeID, storage Storage, logger Logger) (*Acceptor, erro
 //
 // Algorithm:
 //   - If ballot >= our promised ballot for this instance:
-//     - Update promised ballot
-//     - Persist state
-//     - Reply with Promise containing any previously accepted value
+//   - Update promised ballot
+//   - Persist state
+//   - Reply with Promise containing any previously accepted value
 //   - Otherwise:
-//     - Reply with Reject containing our promised ballot
+//   - Reply with Reject containing our promised ballot
 func (a *Acceptor) HandlePrepare(msg *Prepare) Message {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -107,19 +107,24 @@ func (a *Acceptor) HandlePrepare(msg *Prepare) Message {
 		}
 	}
 
-	// Update our promise
+	// Update our promise. Snapshot the prior value so we can roll back if the
+	// persist fails — keeping in-memory state in lockstep with disk.
+	prevPromised, hadPromised := a.promised[instance]
 	a.promised[instance] = ballot
 
-	// Persist before responding (CRITICAL for safety)
 	if err := a.persist(); err != nil {
 		a.logger.Error("Acceptor: failed to persist state", "error", err)
-		// We can't safely respond if we can't persist
-		// Return a reject to be safe
+		if hadPromised {
+			a.promised[instance] = prevPromised
+		} else {
+			delete(a.promised, instance)
+		}
+		// Return a reject so the proposer doesn't believe we promised.
 		return &Reject{
 			Ballot:       ballot,
 			Instance:     instance,
 			FromNode:     a.nodeID,
-			HigherBallot: ballot, // This signals a storage error rather than a higher ballot
+			HigherBallot: ballot, // signals a storage error rather than a higher ballot
 		}
 	}
 
@@ -137,11 +142,11 @@ func (a *Acceptor) HandlePrepare(msg *Prepare) Message {
 //
 // Algorithm:
 //   - If ballot >= our promised ballot for this instance:
-//     - Accept the proposal (update accepted ballot and value)
-//     - Persist state
-//     - Reply with Accepted
+//   - Accept the proposal (update accepted ballot and value)
+//   - Persist state
+//   - Reply with Accepted
 //   - Otherwise:
-//     - Reply with Nack containing our promised ballot
+//   - Reply with Nack containing our promised ballot
 func (a *Acceptor) HandleAccept(msg *Accept) Message {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -174,17 +179,33 @@ func (a *Acceptor) HandleAccept(msg *Accept) Message {
 		}
 	}
 
-	// Accept the proposal
+	// Accept the proposal. Snapshot prior values so a persist failure leaves
+	// the acceptor in a state consistent with what's actually on disk.
+	prevPromised, hadPromised := a.promised[instance]
+	prevAcceptedBallot, hadAcceptedBallot := a.acceptedBallot[instance]
+	prevAcceptedValue, hadAcceptedValue := a.acceptedValue[instance]
+
 	a.promised[instance] = ballot // Also update promise
 	a.acceptedBallot[instance] = ballot
 	a.acceptedValue[instance] = msg.Value
 
-	// Persist before responding (CRITICAL for safety)
 	if err := a.persist(); err != nil {
 		a.logger.Error("Acceptor: failed to persist state", "error", err)
-		// Roll back the acceptance
-		delete(a.acceptedBallot, instance)
-		delete(a.acceptedValue, instance)
+		if hadPromised {
+			a.promised[instance] = prevPromised
+		} else {
+			delete(a.promised, instance)
+		}
+		if hadAcceptedBallot {
+			a.acceptedBallot[instance] = prevAcceptedBallot
+		} else {
+			delete(a.acceptedBallot, instance)
+		}
+		if hadAcceptedValue {
+			a.acceptedValue[instance] = prevAcceptedValue
+		} else {
+			delete(a.acceptedValue, instance)
+		}
 		return &Nack{
 			Ballot:       ballot,
 			Instance:     instance,

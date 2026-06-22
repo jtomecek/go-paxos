@@ -70,7 +70,7 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	proposer := NewProposer(cfg.NodeID, transport, quorumSize, logger)
+	proposer := NewProposer(cfg.NodeID, transport, quorumSize, len(cfg.Peers), logger)
 	proposer.SetTimeouts(cfg.PrepareTimeout, cfg.AcceptTimeout)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -220,6 +220,10 @@ func (n *Node) messageLoop() {
 }
 
 // handleMessage dispatches a message to the appropriate handler.
+//
+// The Node is the sole reader of transport.Receive(). Phase-1/Phase-2
+// responses are forwarded to the Proposer via HandleResponse, which routes
+// them to the matching pending proposal's response channel.
 func (n *Node) handleMessage(env MessageEnvelope) {
 	switch msg := env.Message.(type) {
 	case *Prepare:
@@ -240,8 +244,8 @@ func (n *Node) handleMessage(env MessageEnvelope) {
 	case *Heartbeat:
 		n.handleHeartbeat(msg)
 
-	// Promise, Reject, Accepted, Nack are handled by the proposer
-	// via the transport's Receive channel
+	case *Promise, *Reject, *Accepted, *Nack:
+		n.proposer.HandleResponse(msg)
 	}
 }
 
@@ -343,7 +347,7 @@ func (n *Node) checkLeaderAndHeartbeat() {
 	if isLeader {
 		// Send heartbeat
 		msg := &Heartbeat{
-			Ballot:       n.proposer.leaderBallot,
+			Ballot:       n.proposer.LeaderBallot(),
 			LeaderID:     n.nodeID,
 			LastInstance: lastCommitted,
 		}

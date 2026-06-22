@@ -42,9 +42,9 @@ type Value []byte
 
 // CommittedValue represents a value that has been chosen by consensus.
 type CommittedValue struct {
-	Instance Instance  // Log position
-	Value    Value     // The agreed-upon value
-	Ballot   Ballot    // Ballot that achieved consensus
+	Instance Instance // Log position
+	Value    Value    // The agreed-upon value
+	Ballot   Ballot   // Ballot that achieved consensus
 }
 
 // Config holds the configuration for a Paxos node.

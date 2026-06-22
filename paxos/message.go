@@ -11,20 +11,20 @@ type MessageType uint8
 
 const (
 	// Phase 1 messages
-	MsgPrepare    MessageType = 1 // Proposer -> Acceptors: "May I propose with this ballot?"
-	MsgPromise    MessageType = 2 // Acceptor -> Proposer: "Yes, and here's what I've seen"
-	MsgReject     MessageType = 3 // Acceptor -> Proposer: "No, I've promised a higher ballot"
+	MsgPrepare MessageType = 1 // Proposer -> Acceptors: "May I propose with this ballot?"
+	MsgPromise MessageType = 2 // Acceptor -> Proposer: "Yes, and here's what I've seen"
+	MsgReject  MessageType = 3 // Acceptor -> Proposer: "No, I've promised a higher ballot"
 
 	// Phase 2 messages
-	MsgAccept     MessageType = 4 // Proposer -> Acceptors: "Please accept this value"
-	MsgAccepted   MessageType = 5 // Acceptor -> Proposer: "I accepted it"
-	MsgNack       MessageType = 6 // Acceptor -> Proposer: "Rejected, higher ballot seen"
+	MsgAccept   MessageType = 4 // Proposer -> Acceptors: "Please accept this value"
+	MsgAccepted MessageType = 5 // Acceptor -> Proposer: "I accepted it"
+	MsgNack     MessageType = 6 // Acceptor -> Proposer: "Rejected, higher ballot seen"
 
 	// Commit notification
-	MsgCommit     MessageType = 7 // Leader -> All: "This value is committed"
+	MsgCommit MessageType = 7 // Leader -> All: "This value is committed"
 
 	// Leader election / heartbeat
-	MsgHeartbeat  MessageType = 8 // Leader -> Followers: "I'm still alive"
+	MsgHeartbeat MessageType = 8 // Leader -> Followers: "I'm still alive"
 
 	// Catch-up
 	MsgCatchupReq MessageType = 9  // Follower -> Leader: "I'm behind, send me entries"
@@ -102,13 +102,14 @@ func decodePrepare(r io.Reader) (*Prepare, error) {
 
 // Promise is sent by an acceptor in response to Prepare.
 // "I promise not to accept proposals with ballot < B.
-//  Here's the highest ballot and value I've accepted (if any)."
+//
+//	Here's the highest ballot and value I've accepted (if any)."
 type Promise struct {
-	Ballot         Ballot   // The ballot we're promising
+	Ballot         Ballot // The ballot we're promising
 	Instance       Instance
 	FromNode       NodeID
-	AcceptedBallot Ballot   // Highest ballot we've accepted (0 if none)
-	AcceptedValue  Value    // Value of the accepted proposal (nil if none)
+	AcceptedBallot Ballot // Highest ballot we've accepted (0 if none)
+	AcceptedValue  Value  // Value of the accepted proposal (nil if none)
 }
 
 func (m *Promise) Type() MessageType { return MsgPromise }
@@ -172,10 +173,10 @@ func decodePromise(r io.Reader) (*Promise, error) {
 
 // Reject is sent when an acceptor has promised a higher ballot.
 type Reject struct {
-	Ballot        Ballot   // The ballot that was rejected
-	Instance      Instance
-	FromNode      NodeID
-	HigherBallot  Ballot   // The higher ballot we've promised
+	Ballot       Ballot // The ballot that was rejected
+	Instance     Instance
+	FromNode     NodeID
+	HigherBallot Ballot // The higher ballot we've promised
 }
 
 func (m *Reject) Type() MessageType { return MsgReject }

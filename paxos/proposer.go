@@ -19,6 +19,7 @@ type Proposer struct {
 	transport  Transport
 	logger     Logger
 	quorumSize int
+	peerCount  int
 
 	prepareTimeout time.Duration
 	acceptTimeout  time.Duration
@@ -37,23 +38,30 @@ type Proposer struct {
 	// nextInstance is the next instance number to propose for
 	nextInstance Instance
 
-	// pending tracks in-flight proposals
+	// pending tracks in-flight proposals, keyed by instance.
+	// Node.handleMessage looks responses up here via HandleResponse.
 	pending map[Instance]*proposalState
 }
 
 // proposalState tracks the state of a single proposal.
+//
+// `responses` receives Promise / Reject / Accepted / Nack messages routed by
+// Node.handleMessage via Proposer.HandleResponse. The buffer is sized so that
+// every peer can deliver one Phase-1 and one Phase-2 response without blocking
+// the message loop.
 type proposalState struct {
-	instance   Instance
-	ballot     Ballot
-	value      Value
-	promises   []*Promise
-	accepteds  []*Accepted
-	done       chan error
-	committed  bool
+	instance  Instance
+	ballot    Ballot
+	value     Value
+	responses chan Message
 }
 
 // NewProposer creates a new proposer.
-func NewProposer(nodeID NodeID, transport Transport, quorumSize int, logger Logger) *Proposer {
+//
+// peerCount is the number of remote peers (excluding self); it sizes the
+// per-proposal response buffer so the message loop never blocks delivering
+// matching Promise/Accepted/Reject/Nack messages.
+func NewProposer(nodeID NodeID, transport Transport, quorumSize, peerCount int, logger Logger) *Proposer {
 	if logger == nil {
 		logger = NoopLogger{}
 	}
@@ -63,6 +71,7 @@ func NewProposer(nodeID NodeID, transport Transport, quorumSize int, logger Logg
 		transport:      transport,
 		logger:         logger,
 		quorumSize:     quorumSize,
+		peerCount:      peerCount,
 		prepareTimeout: 1 * time.Second,
 		acceptTimeout:  1 * time.Second,
 		currentRound:   0,
@@ -97,9 +106,7 @@ func (p *Proposer) Propose(ctx context.Context, value Value) (Instance, error) {
 		instance:  instance,
 		ballot:    ballot,
 		value:     value,
-		promises:  make([]*Promise, 0),
-		accepteds: make([]*Accepted, 0),
-		done:      make(chan error, 1),
+		responses: make(chan Message, p.responseBufferSize()),
 	}
 	p.pending[instance] = state
 	p.mu.Unlock()
@@ -147,6 +154,10 @@ func (p *Proposer) Propose(ctx context.Context, value Value) (Instance, error) {
 
 // runPhase1 executes the Prepare phase.
 // Returns any previously accepted value that we must use.
+//
+// Responses are delivered to state.responses by Node.handleMessage via
+// HandleResponse; HandleResponse already filters by (instance, ballot) so any
+// message that arrives here belongs to this proposal.
 func (p *Proposer) runPhase1(ctx context.Context, state *proposalState) (Value, error) {
 	p.logger.Debug("Proposer: starting Phase 1",
 		"instance", state.instance,
@@ -168,50 +179,44 @@ func (p *Proposer) runPhase1(ctx context.Context, state *proposalState) (Value, 
 	defer cancel()
 
 	promises := make([]*Promise, 0, p.quorumSize)
-	responses := p.transport.Receive()
 
 	for {
 		select {
 		case <-ctx.Done():
-			if len(promises) >= p.quorumSize {
-				break
-			}
 			return nil, ErrTimeout
 
-		case env := <-responses:
-			switch msg := env.Message.(type) {
+		case msg := <-state.responses:
+			switch m := msg.(type) {
 			case *Promise:
-				if msg.Ballot == state.ballot && msg.Instance == state.instance {
-					promises = append(promises, msg)
-					p.logger.Debug("Proposer: received Promise",
-						"instance", state.instance,
-						"from", msg.FromNode,
-						"count", len(promises),
-						"need", p.quorumSize,
-					)
+				promises = append(promises, m)
+				p.logger.Debug("Proposer: received Promise",
+					"instance", state.instance,
+					"from", m.FromNode,
+					"count", len(promises),
+					"need", p.quorumSize,
+				)
 
-					if len(promises) >= p.quorumSize {
-						// Find highest accepted value (if any)
-						return p.findHighestAccepted(promises), nil
-					}
+				if len(promises) >= p.quorumSize {
+					return p.findHighestAccepted(promises), nil
 				}
 
 			case *Reject:
-				if msg.Ballot == state.ballot && msg.Instance == state.instance {
-					p.logger.Debug("Proposer: received Reject",
-						"instance", state.instance,
-						"from", msg.FromNode,
-						"higherBallot", msg.HigherBallot,
-					)
-					// A higher ballot exists - we're preempted
-					return nil, ErrPreempted
-				}
+				p.logger.Debug("Proposer: received Reject",
+					"instance", state.instance,
+					"from", m.FromNode,
+					"higherBallot", m.HigherBallot,
+				)
+				return nil, ErrPreempted
 			}
 		}
 	}
 }
 
 // runPhase2 executes the Accept phase.
+//
+// Late Phase-1 responses (Promise / Reject) may still arrive on
+// state.responses if they were in flight when Phase 1 completed; the type
+// switch below silently discards them.
 func (p *Proposer) runPhase2(ctx context.Context, state *proposalState) error {
 	p.logger.Debug("Proposer: starting Phase 2",
 		"instance", state.instance,
@@ -235,43 +240,34 @@ func (p *Proposer) runPhase2(ctx context.Context, state *proposalState) error {
 	defer cancel()
 
 	accepteds := make([]*Accepted, 0, p.quorumSize)
-	responses := p.transport.Receive()
 
 	for {
 		select {
 		case <-ctx.Done():
-			if len(accepteds) >= p.quorumSize {
-				break
-			}
 			return ErrTimeout
 
-		case env := <-responses:
-			switch msg := env.Message.(type) {
+		case msg := <-state.responses:
+			switch m := msg.(type) {
 			case *Accepted:
-				if msg.Ballot == state.ballot && msg.Instance == state.instance {
-					accepteds = append(accepteds, msg)
-					p.logger.Debug("Proposer: received Accepted",
-						"instance", state.instance,
-						"from", msg.FromNode,
-						"count", len(accepteds),
-						"need", p.quorumSize,
-					)
+				accepteds = append(accepteds, m)
+				p.logger.Debug("Proposer: received Accepted",
+					"instance", state.instance,
+					"from", m.FromNode,
+					"count", len(accepteds),
+					"need", p.quorumSize,
+				)
 
-					if len(accepteds) >= p.quorumSize {
-						// Value is chosen! Broadcast commit.
-						return p.broadcastCommit(ctx, state)
-					}
+				if len(accepteds) >= p.quorumSize {
+					return p.broadcastCommit(ctx, state)
 				}
 
 			case *Nack:
-				if msg.Ballot == state.ballot && msg.Instance == state.instance {
-					p.logger.Debug("Proposer: received Nack",
-						"instance", state.instance,
-						"from", msg.FromNode,
-						"higherBallot", msg.HigherBallot,
-					)
-					return ErrPreempted
-				}
+				p.logger.Debug("Proposer: received Nack",
+					"instance", state.instance,
+					"from", m.FromNode,
+					"higherBallot", m.HigherBallot,
+				)
+				return ErrPreempted
 			}
 		}
 	}
@@ -316,25 +312,36 @@ func (p *Proposer) findHighestAccepted(promises []*Promise) Value {
 // BecomeLeader attempts to establish this node as the leader.
 // This runs Phase 1 for a range of instances, allowing
 // subsequent proposals to skip directly to Phase 2.
+//
+// NOTE: Phase 2 of the broader fix plan replaces this with a prefix-Prepare
+// that covers all instances >= fromInstance in one round. Until that lands,
+// this still runs Phase 1 against the magic instance 0 and the fast path is
+// not actually applied in Propose.
 func (p *Proposer) BecomeLeader(ctx context.Context, fromInstance Instance) error {
 	p.mu.Lock()
 	p.currentRound++
 	ballot := MakeBallot(p.currentRound, uint16(p.nodeID))
+
+	state := &proposalState{
+		instance:  0, // Special "leadership" instance
+		ballot:    ballot,
+		responses: make(chan Message, p.responseBufferSize()),
+	}
+	p.pending[0] = state
 	p.mu.Unlock()
+
+	defer func() {
+		p.mu.Lock()
+		delete(p.pending, 0)
+		p.mu.Unlock()
+	}()
 
 	p.logger.Info("Proposer: attempting to become leader",
 		"ballot", ballot,
 		"fromInstance", fromInstance,
 	)
 
-	// Run Phase 1 for the leadership instance (instance 0 is special)
-	state := &proposalState{
-		instance: 0, // Special "leadership" instance
-		ballot:   ballot,
-	}
-
-	_, err := p.runPhase1(ctx, state)
-	if err != nil {
+	if _, err := p.runPhase1(ctx, state); err != nil {
 		return err
 	}
 
@@ -357,10 +364,72 @@ func (p *Proposer) IsLeader() bool {
 	return p.isLeader
 }
 
+// LeaderBallot returns the ballot this proposer is using as leader. The
+// returned value is meaningful only when IsLeader() is true; concurrent
+// callers must accept that the ballot can change after the call returns.
+func (p *Proposer) LeaderBallot() Ballot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.leaderBallot
+}
+
 // StepDown marks this proposer as no longer being the leader.
 func (p *Proposer) StepDown() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.isLeader = false
 	p.logger.Info("Proposer: stepped down from leadership")
+}
+
+// HandleResponse routes a Phase-1/Phase-2 response message to the pending
+// proposal it belongs to. Called by Node.handleMessage. It is non-blocking:
+// if the proposal's response buffer is full (which should not happen given
+// responseBufferSize accounts for one Promise + one Accepted per peer), the
+// message is dropped and a warning is logged.
+func (p *Proposer) HandleResponse(msg Message) {
+	var instance Instance
+	var ballot Ballot
+
+	switch m := msg.(type) {
+	case *Promise:
+		instance, ballot = m.Instance, m.Ballot
+	case *Reject:
+		instance, ballot = m.Instance, m.Ballot
+	case *Accepted:
+		instance, ballot = m.Instance, m.Ballot
+	case *Nack:
+		instance, ballot = m.Instance, m.Ballot
+	default:
+		return
+	}
+
+	p.mu.Lock()
+	state, ok := p.pending[instance]
+	p.mu.Unlock()
+
+	if !ok || state.ballot != ballot {
+		// No matching proposal — stale response from a finished or preempted
+		// attempt. Safe to drop.
+		return
+	}
+
+	select {
+	case state.responses <- msg:
+	default:
+		p.logger.Warn("Proposer: response buffer full, dropping",
+			"instance", instance,
+			"ballot", ballot,
+		)
+	}
+}
+
+// responseBufferSize returns the per-proposal response buffer size: at least
+// one Promise plus one Accepted from each peer, so the message loop never
+// blocks delivering matching responses.
+func (p *Proposer) responseBufferSize() int {
+	n := 2*p.peerCount + 1
+	if n < 4 {
+		n = 4
+	}
+	return n
 }

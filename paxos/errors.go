@@ -4,9 +4,9 @@ import "errors"
 
 // Configuration errors
 var (
-	ErrInvalidNodeID          = errors.New("paxos: node ID must be non-zero")
-	ErrInvalidAddress         = errors.New("paxos: address is required")
-	ErrNoPeers                = errors.New("paxos: at least one peer is required")
+	ErrInvalidNodeID           = errors.New("paxos: node ID must be non-zero")
+	ErrInvalidAddress          = errors.New("paxos: address is required")
+	ErrNoPeers                 = errors.New("paxos: at least one peer is required")
 	ErrElectionTimeoutTooShort = errors.New("paxos: election timeout must be > 3x heartbeat interval")
 )
 
