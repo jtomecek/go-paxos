@@ -67,7 +67,7 @@ func NewNode(cfg Config) (*Node, error) {
 
 	transport := cfg.Transport
 	if transport == nil {
-		transport = NewTCPTransport(logger)
+		transport = NewTCPTransport(cfg.NodeID, logger)
 	}
 
 	// Calculate quorum size: majority of total nodes (including self)

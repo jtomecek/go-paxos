@@ -140,8 +140,8 @@ type Transport interface {
 	// Connect establishes a connection to a peer.
 	Connect(addr string) error
 
-	// Send transmits a message to a specific peer.
-	Send(ctx context.Context, to string, msg Message) error
+	// Send transmits a message to a specific peer, identified by its NodeID.
+	Send(ctx context.Context, to NodeID, msg Message) error
 
 	// Broadcast sends a message to all connected peers.
 	Broadcast(ctx context.Context, msg Message) error
@@ -155,7 +155,7 @@ type Transport interface {
 
 // MessageEnvelope wraps a message with sender information.
 type MessageEnvelope struct {
-	From    string  // Sender address
+	From    NodeID  // Sender node, learned from the connection handshake
 	Message Message // The message itself
 }
 

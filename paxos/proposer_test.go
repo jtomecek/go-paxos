@@ -25,7 +25,7 @@ func newFakeTransport() *fakeTransport {
 
 func (t *fakeTransport) Listen(addr string) error                               { return nil }
 func (t *fakeTransport) Connect(addr string) error                              { return nil }
-func (t *fakeTransport) Send(ctx context.Context, to string, msg Message) error { return nil }
+func (t *fakeTransport) Send(ctx context.Context, to NodeID, msg Message) error { return nil }
 
 func (t *fakeTransport) Broadcast(ctx context.Context, msg Message) error {
 	t.mu.Lock()
