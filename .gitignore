@@ -27,3 +27,10 @@ Thumbs.db
 # Build output
 /bin/
 /dist/
+
+# Compiled example binaries
+/examples/kv-store/kv-store
+/examples/counter/counter
+
+# Local Claude Code config
+.claude/
